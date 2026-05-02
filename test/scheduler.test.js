@@ -156,6 +156,145 @@ describe('recordAccountError / recordAccountSuccess', () => {
   });
 });
 
+describe('Bug A — post-cooldown lazy decay', () => {
+  // Once the self-cooldown window has naturally elapsed, _ensureSchedulerState
+  // should clear both the timestamp and the consecutive-error counter so the
+  // account stops being score-penalized indefinitely. The decay is triggered
+  // by any code path that calls _ensureSchedulerState — getApiKey's prune
+  // pass, or any record* helper. Here we use recordAccountSuccess on a real
+  // pool account because that's the most direct public surface that touches
+  // _ensureSchedulerState.
+  it('clears _consecutiveErrors when cooldown timestamp is in the past', async () => {
+    const { addAccountByKey, recordAccountSuccess, removeAccount } =
+      await import('../src/auth.js');
+    const apiKey = 'sk-test-buga-' + Math.random().toString(36).slice(2);
+    const acct = addAccountByKey(apiKey, 'buga-test');
+    try {
+      acct._consecutiveErrors = 5;
+      acct._errorCooldownUntil = Date.now() - 1000;
+      // recordAccountSuccess invokes _ensureSchedulerState which should
+      // observe the past cooldown and zero everything.
+      recordAccountSuccess(apiKey);
+      assert.equal(acct._consecutiveErrors, 0,
+        'expired cooldown should have decayed counter to 0');
+      assert.equal(acct._errorCooldownUntil, 0,
+        'expired cooldown timestamp should have been cleared');
+    } finally {
+      removeAccount(acct.id);
+    }
+  });
+
+  it('leaves _consecutiveErrors alone while cooldown is still active', async () => {
+    const { addAccountByKey, recordAccountError, removeAccount } =
+      await import('../src/auth.js');
+    const apiKey = 'sk-test-buga2-' + Math.random().toString(36).slice(2);
+    const acct = addAccountByKey(apiKey, 'buga-active');
+    try {
+      acct._consecutiveErrors = 4;
+      acct._errorCooldownUntil = Date.now() + 60_000;
+      // Triggers _ensureSchedulerState via the record helper.
+      recordAccountError(apiKey, 'rate_limit');
+      // _consecutiveErrors should now be 5 (incremented), NOT reset to 0.
+      assert.equal(acct._consecutiveErrors, 5,
+        'active cooldown must NOT reset counter; record* should still increment');
+      assert.ok(acct._errorCooldownUntil > Date.now(),
+        'active cooldown timestamp preserved');
+    } finally {
+      removeAccount(acct.id);
+    }
+  });
+});
+
+describe('Bug F — getAccountAvailability surfaces self_cooldown', () => {
+  // We need a real account in the pool to test getAccountAvailability since it
+  // does accounts.find. The test reuses the public addAccountByKey + manual
+  // state stamping path.
+  it('returns reason=self_cooldown with correct retryAfterMs', async () => {
+    const { addAccountByKey, getAccountAvailability, removeAccount } =
+      await import('../src/auth.js');
+    const test_apiKey = 'sk-test-bugf-' + Math.random().toString(36).slice(2);
+    const acct = addAccountByKey(test_apiKey, 'bugf-test');
+    try {
+      acct.tier = 'pro';   // ensure RPM check passes
+      acct._errorCooldownUntil = Date.now() + 30_000;   // 30s remaining
+      acct._consecutiveErrors = 5;
+      const avail = getAccountAvailability(test_apiKey, null);
+      assert.equal(avail.available, false);
+      assert.equal(avail.reason, 'self_cooldown');
+      assert.ok(avail.retryAfterMs >= 25_000 && avail.retryAfterMs <= 31_000,
+        `retryAfterMs should be ~30s, got ${avail.retryAfterMs}`);
+    } finally {
+      removeAccount(acct.id);
+    }
+  });
+
+  it('does not flag self_cooldown when timestamp is in the past', async () => {
+    const { addAccountByKey, getAccountAvailability, removeAccount } =
+      await import('../src/auth.js');
+    const test_apiKey = 'sk-test-bugf2-' + Math.random().toString(36).slice(2);
+    const acct = addAccountByKey(test_apiKey, 'bugf-past');
+    try {
+      acct.tier = 'pro';
+      acct._errorCooldownUntil = Date.now() - 1000;  // expired
+      acct._consecutiveErrors = 5;
+      const avail = getAccountAvailability(test_apiKey, null);
+      // Either available=true (the lazy-decay path cleared the cooldown),
+      // or available=false with a different reason — but never self_cooldown.
+      assert.notEqual(avail.reason, 'self_cooldown');
+    } finally {
+      removeAccount(acct.id);
+    }
+  });
+});
+
+describe('Bug D — extractBodyCallerSubKey stable across optional fields', () => {
+  it('returns the same subkey for {user} and {user, conversation_id}', async () => {
+    const { extractBodyCallerSubKey } = await import('../src/caller-key.js');
+    const a = extractBodyCallerSubKey({ user: 'alice' });
+    const b = extractBodyCallerSubKey({ user: 'alice', metadata: { conversation_id: 'c1' } });
+    assert.equal(a, b,
+      'subkey should pin to body.user — adding/removing optional ids must not change it');
+  });
+
+  it('returns the same subkey when previous_response_id appears or disappears', async () => {
+    const { extractBodyCallerSubKey } = await import('../src/caller-key.js');
+    const a = extractBodyCallerSubKey({ user: 'bob', previous_response_id: 'r1' });
+    const b = extractBodyCallerSubKey({ user: 'bob' });
+    const c = extractBodyCallerSubKey({ user: 'bob', previous_response_id: 'r2' });
+    assert.equal(a, b);
+    assert.equal(b, c);
+  });
+
+  it('different users produce different subkeys', async () => {
+    const { extractBodyCallerSubKey } = await import('../src/caller-key.js');
+    const alice = extractBodyCallerSubKey({ user: 'alice' });
+    const bob   = extractBodyCallerSubKey({ user: 'bob' });
+    assert.notEqual(alice, bob);
+  });
+
+  it('falls through to next signal when user is absent', async () => {
+    const { extractBodyCallerSubKey } = await import('../src/caller-key.js');
+    // user absent → falls through to metadata.conversation_id
+    const a = extractBodyCallerSubKey({ metadata: { conversation_id: 'c1' } });
+    // Same value via the same priority slot must produce the same hash —
+    // that's the whole stability point.
+    const b = extractBodyCallerSubKey({ metadata: { conversation_id: 'c1' } });
+    assert.equal(a, b);
+    // user present should pin on user, not the conversation_id below it.
+    const withUser = extractBodyCallerSubKey({ user: 'alice', metadata: { conversation_id: 'c1' } });
+    const onlyUser = extractBodyCallerSubKey({ user: 'alice' });
+    assert.equal(withUser, onlyUser, 'user should win priority over conversation_id');
+    assert.notEqual(withUser, a, 'user-pinned subkey should differ from conversation-pinned');
+  });
+
+  it('returns empty string when no signals present', async () => {
+    const { extractBodyCallerSubKey } = await import('../src/caller-key.js');
+    assert.equal(extractBodyCallerSubKey({}), '');
+    assert.equal(extractBodyCallerSubKey(null), '');
+    assert.equal(extractBodyCallerSubKey('not-an-object'), '');
+  });
+});
+
 describe('runtime-config scheduler defaults', () => {
   it('returns sane defaults', () => {
     const s = getSchedulerConfig();

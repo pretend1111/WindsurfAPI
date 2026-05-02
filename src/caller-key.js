@@ -19,15 +19,23 @@ function sha256Hex(value) {
 // pinned to (apiKey, user/session). Returns '' when no usable signal.
 export function extractBodyCallerSubKey(body) {
   if (!body || typeof body !== 'object') return '';
+  // Bug D fix: pick the FIRST available signal in priority order rather
+  // than hashing the join of every present field. Concatenating made the
+  // subkey unstable across turns whenever an OpenAI / Responses client
+  // optionally included conversation_id or previous_response_id — same
+  // user, different bucket, zero cascade reuse. Priority order keeps the
+  // most stable identity (explicit user id) ahead of per-turn ids.
   const candidates = [
     typeof body.user === 'string' ? body.user : '',
     typeof body?.metadata?.conversation_id === 'string' ? body.metadata.conversation_id : '',
     typeof body.conversation === 'string' ? body.conversation : '',
-    typeof body.previous_response_id === 'string' ? body.previous_response_id : '',
     typeof body?.metadata?.session_id === 'string' ? body.metadata.session_id : '',
-  ].filter(Boolean);
-  if (!candidates.length) return '';
-  return sha256Hex(candidates.join('|')).slice(0, 16);
+    typeof body.previous_response_id === 'string' ? body.previous_response_id : '',
+  ];
+  for (const c of candidates) {
+    if (c) return sha256Hex(`v2|${c}`).slice(0, 16);
+  }
+  return '';
 }
 
 // IP + UA fallback used when an apiKey-mode caller has no explicit body

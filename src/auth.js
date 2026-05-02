@@ -517,6 +517,16 @@ function _ensureSchedulerState(account) {
   if (typeof account._consecutiveErrors !== 'number') account._consecutiveErrors = 0;
   if (typeof account._errorCooldownUntil !== 'number') account._errorCooldownUntil = 0;
   if (!Array.isArray(account._reqsTimeline)) account._reqsTimeline = [];
+  // Bug A fix: once the self-cooldown window has naturally elapsed, decay
+  // the consecutive-error counter back to zero. Without this, an account
+  // that hit the cooldown threshold stays score-penalized forever (the
+  // recentError sub-term in _scheduleScore is consecutiveErrors/threshold,
+  // clamped at 1) because the only existing reset path is on a successful
+  // request — and starved accounts never see successes.
+  if (account._errorCooldownUntil > 0 && account._errorCooldownUntil <= Date.now()) {
+    account._errorCooldownUntil = 0;
+    account._consecutiveErrors = 0;
+  }
 }
 
 function _pruneReqsTimeline(account, now, windowMs) {
@@ -834,6 +844,18 @@ export function getAccountAvailability(apiKey, modelKey = null) {
 
   if (a.rateLimitedUntil && a.rateLimitedUntil > now) {
     return { available: false, reason: 'rate_limited', retryAfterMs: Math.max(1000, a.rateLimitedUntil - now) };
+  }
+  // Bug F fix: surface self-cooldown to strict-reuse callers. Without
+  // this, getAccountAvailability says "available, retryAfterMs=0" while
+  // acquireAccountByKey returns null on the same account, and the caller
+  // either spins or gives up instead of waiting out the short window.
+  // Mirrors the guard in acquireAccountByKey.
+  if (a._errorCooldownUntil && a._errorCooldownUntil > now) {
+    return {
+      available: false,
+      reason: 'self_cooldown',
+      retryAfterMs: Math.max(1000, a._errorCooldownUntil - now),
+    };
   }
   if (modelKey && a._modelRateLimits) {
     const until = a._modelRateLimits[modelKey];
