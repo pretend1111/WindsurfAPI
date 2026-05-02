@@ -24,6 +24,42 @@ const DEFAULTS = {
     // chat request. Reduces wasted attempts when the account has no message
     // capacity. Adds one network round-trip per attempt so off by default.
     preflightRateLimit: false,
+    // Caller-aware account scheduler. When ON, getApiKey adds extra terms
+    // to the account-selection score: stick same caller (callerKey) to
+    // accounts they recently used so Anthropic prompt-cache prefixes survive
+    // even when the conversation-pool fingerprint missed; demote accounts
+    // that are approaching their RPM cap (so the next request doesn't
+    // tip them over) and accounts that just reported upstream errors
+    // (self-cooldown until they recover). When OFF (default) the original
+    // inflight + RPM-headroom + LRU scoring is used unchanged.
+    callerAffinityScheduler: false,
+  },
+  scheduler: {
+    // TTL for stick-to-same-account memory of a callerKey. 5 min matches
+    // Anthropic's prompt-cache TTL — past that the cache is gone anyway,
+    // so spreading across the pool is fine.
+    callerAffinityTtlMs: 5 * 60 * 1000,
+    // RPM-utilization threshold above which an account is demoted to
+    // discourage piling onto a near-full account.
+    rpmWarningThreshold: 0.85,
+    // Once an account hits this many consecutive upstream errors, hold it
+    // in cooldown (see errorCooldownMs) before considering it again.
+    consecutiveErrorThreshold: 3,
+    errorCooldownMs: 5 * 60 * 1000,
+    // Long-window load-balance signal — penalize accounts that took too
+    // many requests over the last hour relative to the pool mean.
+    loadBalanceWindowMs: 60 * 60 * 1000,
+    // Score weights. All terms are normalized to [0,1] before weighting.
+    // Larger means stronger pull / push.
+    weights: {
+      inflight: 1.0,        // pull: prefer fewer in-flight requests
+      rpmHeadroom: 0.7,     // pull: prefer larger remaining RPM ratio
+      callerAffinity: 0.6,  // pull: same callerKey recently → strong stick
+      warmCascade: 0.5,     // pull: account has live cascade for this caller
+      approachLimit: 0.8,   // push: discount accounts close to RPM cap
+      recentError: 1.0,     // push: discount accounts with recent upstream errors
+      loadImbalance: 0.3,   // push: long-term over-served accounts
+    },
   },
   // System-level prompt templates injected into Cascade proto fields.
   // Editable from Dashboard so users can tune without code changes.
@@ -97,6 +133,29 @@ export function setExperimental(patch) {
   }
   persist();
   return getExperimental();
+}
+
+/**
+ * Read the active scheduler config (defaults merged with whatever the dashboard
+ * has persisted). Returns a deep copy so callers can't accidentally mutate
+ * the live state by reference.
+ */
+export function getSchedulerConfig() {
+  const dflt = DEFAULTS.scheduler;
+  const cur = _state.scheduler || {};
+  return {
+    callerAffinityTtlMs: Number.isFinite(cur.callerAffinityTtlMs) && cur.callerAffinityTtlMs > 0
+      ? cur.callerAffinityTtlMs : dflt.callerAffinityTtlMs,
+    rpmWarningThreshold: Number.isFinite(cur.rpmWarningThreshold)
+      ? Math.min(1, Math.max(0, cur.rpmWarningThreshold)) : dflt.rpmWarningThreshold,
+    consecutiveErrorThreshold: Number.isFinite(cur.consecutiveErrorThreshold) && cur.consecutiveErrorThreshold > 0
+      ? cur.consecutiveErrorThreshold : dflt.consecutiveErrorThreshold,
+    errorCooldownMs: Number.isFinite(cur.errorCooldownMs) && cur.errorCooldownMs >= 0
+      ? cur.errorCooldownMs : dflt.errorCooldownMs,
+    loadBalanceWindowMs: Number.isFinite(cur.loadBalanceWindowMs) && cur.loadBalanceWindowMs > 0
+      ? cur.loadBalanceWindowMs : dflt.loadBalanceWindowMs,
+    weights: { ...dflt.weights, ...(cur.weights || {}) },
+  };
 }
 
 export function getSystemPrompts() {

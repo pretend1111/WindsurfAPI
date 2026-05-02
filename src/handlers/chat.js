@@ -5,7 +5,7 @@
 
 import { createHash, randomUUID } from 'crypto';
 import { WindsurfClient, contentToString, isCascadeTransportError } from '../client.js';
-import { getApiKey, acquireAccountByKey, releaseAccount, getAccountAvailability, reportError, reportSuccess, markRateLimited, reportInternalError, updateCapability, getAccountList, isAllRateLimited, isAllTemporarilyUnavailable, refundReservation } from '../auth.js';
+import { getApiKey, acquireAccountByKey, releaseAccount, getAccountAvailability, reportError, reportSuccess, markRateLimited, reportInternalError, updateCapability, getAccountList, isAllRateLimited, isAllTemporarilyUnavailable, refundReservation, recordCallerAffinity, recordWarmCascade, recordAccountError, recordAccountSuccess } from '../auth.js';
 import { resolveModel, getModelInfo } from '../models.js';
 import { getLsFor, ensureLs } from '../langserver.js';
 import { config, log } from '../config.js';
@@ -1001,14 +1001,20 @@ function buildUsageBody(serverUsage, messages, completionText, thinkingText = ''
 // Wait until getApiKey returns a non-null account, or until maxWaitMs expires.
 // Used when every account has momentarily exhausted its RPM budget so the
 // client is queued instead of getting a 503.
-async function waitForAccount(tried, signal, maxWaitMs = QUEUE_MAX_WAIT_MS, modelKey = null) {
+//
+// `callerKey` is forwarded to getApiKey so the caller-aware scheduler (when
+// enabled via runtime-config) can prefer the same account this caller used
+// recently. Old callers passing only 4 positional args still work because
+// the parameter defaults to ''.
+async function waitForAccount(tried, signal, maxWaitMs = QUEUE_MAX_WAIT_MS, modelKey = null, callerKey = '') {
   const deadline = Date.now() + maxWaitMs;
-  let acct = getApiKey(tried, modelKey);
+  const opts = callerKey ? { callerKey } : undefined;
+  let acct = getApiKey(tried, modelKey, opts);
   while (!acct) {
     if (signal?.aborted) return null;
     if (Date.now() >= deadline) return null;
     await new Promise(r => setTimeout(r, QUEUE_RETRY_MS));
-    acct = getApiKey(tried, modelKey);
+    acct = getApiKey(tried, modelKey, opts);
   }
   return acct;
 }
@@ -1435,7 +1441,7 @@ export async function handleChatCompletions(body, context = {}) {
       }
     }
     if (!acct) {
-      acct = await waitForAccountFn(tried, null, QUEUE_MAX_WAIT_MS, routingModelKey);
+      acct = await waitForAccountFn(tried, null, QUEUE_MAX_WAIT_MS, routingModelKey, callerKey);
       if (!acct) {
         // Same diagnostic-error fix as the stream path — surface real reason
         // for the queue timeout (rate limit / no entitlement / upstream stall)
@@ -1520,7 +1526,20 @@ export async function handleChatCompletions(body, context = {}) {
       modelInfo?.provider || null,
       emulateTools, toolPreamble, wantJson, cachePolicy, wantThinking,
     );
-    if (result.status === 200) return result;
+    if (result.status === 200) {
+      // Caller-aware scheduler: remember the (callerKey → account) pair so
+      // the next request from the same client returns to this account and
+      // benefits from the upstream prompt-cache prefix that was just laid
+      // down. Also reset the consecutive-error counter (the account just
+      // proved it's healthy). Both are no-ops when the scheduler flag is
+      // off — they just touch private maps that nothing else reads.
+      if (callerKey) {
+        recordCallerAffinity(acct.apiKey, callerKey);
+        if (reuseEnabled) recordWarmCascade(acct.apiKey, callerKey);
+      }
+      recordAccountSuccess(acct.apiKey);
+      return result;
+    }
     reuseEntry = null; // don't try to reuse on the retry
     if (result.reuseEntryInvalid) reuseEntryDead = true;
     // #101: same upstream-timeout invalidation as the stream path —
@@ -1553,6 +1572,11 @@ export async function handleChatCompletions(body, context = {}) {
         };
       }
       log.warn(`Account ${acct.email} rate-limited on ${displayModel}, trying next account`);
+      // Surface to the scheduler. Rate-limited counts as a transient health
+      // signal — repeated occurrences within a short window will cooldown
+      // the account so it stops being preferred for new requests until
+      // upstream eases up.
+      recordAccountError(acct.apiKey, 'rate_limit');
       continue;
     }
     // Cascade transient 错误通常是上游或本地 LS 短暂抖动，先退避再切账号，避免连续打爆同一热窗口。
@@ -1560,6 +1584,7 @@ export async function handleChatCompletions(body, context = {}) {
       internalCount++;
       const backoffMs = await internalErrorBackoff(internalCount - 1);
       log.warn(`Chat[${reqId}]: ${acct.email} upstream transient error, waited ${backoffMs}ms before next account`);
+      recordAccountError(acct.apiKey, errType);
       continue;
     }
     // Model not available on this account (permission_denied, etc.)
@@ -2101,7 +2126,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             }
           }
           if (!acct) {
-            acct = await waitForAccountFn(tried, abortController.signal, QUEUE_MAX_WAIT_MS, modelKey);
+            acct = await waitForAccountFn(tried, abortController.signal, QUEUE_MAX_WAIT_MS, modelKey, callerKey);
             if (!acct) {
               // Without an explicit lastErr here, the final retry-failed log
               // ends up printing an empty message and the SSE error event
@@ -2271,6 +2296,16 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             if (ckey && !collectedToolCalls.length && (accText || accThinking)) {
               cacheSet(ckey, { text: accText, thinking: accThinking });
             }
+            // Caller-aware scheduler hook: stream finished cleanly. Same as
+            // the non-stream success branch, remember the (callerKey, account)
+            // pair so the next turn returns here for prompt-cache continuity,
+            // and clear the consecutive-error counter that may have been
+            // bumped by an earlier retry on this same account.
+            if (callerKey && currentApiKey) {
+              recordCallerAffinity(currentApiKey, callerKey);
+              if (reuseEnabled !== false) recordWarmCascade(currentApiKey, callerKey);
+            }
+            if (currentApiKey) recordAccountSuccess(currentApiKey);
             return;
           } catch (err) {
             lastErr = err;
@@ -2302,6 +2337,14 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             if (isRateLimit) { markRateLimited(currentApiKey, rateLimitCooldownMs(err.message), modelKey); err.isRateLimit = true; err.isModelError = true; err.kind ||= 'model_error'; }
             if (isInternal) { reportInternalError(currentApiKey); err.isModelError = true; err.kind ||= 'transient_stall'; }
             if (isTransport) { err.isModelError = true; err.kind ||= 'transient_stall'; }
+            // Surface to caller-aware scheduler. The legacy reportError /
+            // markRateLimited / reportInternalError calls update upstream-
+            // observable health, but they don't roll up into a "I just
+            // failed three times in a row" cooldown — that's what
+            // recordAccountError does. Cheap when scheduler flag is off
+            // (just touches the account's _consecutiveErrors counter).
+            if (isRateLimit) recordAccountError(currentApiKey, 'rate_limit');
+            else if (isInternal || isTransport) recordAccountError(currentApiKey, 'upstream_transient');
             if (err.isModelError && err.kind !== 'transient_stall' && !isRateLimit && !isInternal) {
               updateCapability(currentApiKey, modelKey, false, 'model_error');
             }

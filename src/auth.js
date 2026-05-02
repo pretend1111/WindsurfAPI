@@ -13,6 +13,7 @@ import { readFileSync, writeFileSync, existsSync, renameSync, unlinkSync, readdi
 import { config, log } from './config.js';
 import { getEffectiveProxy } from './dashboard/proxy-config.js';
 import { getTierModels, getModelKeysByEnum, MODELS, registerDiscoveredFreeModel } from './models.js';
+import { isExperimentalEnabled, getSchedulerConfig } from './runtime-config.js';
 
 import { join } from 'path';
 // accounts.json lives in the cluster-shared dir so add-account writes from
@@ -496,6 +497,183 @@ export function removeAccount(id) {
   return true;
 }
 
+// ─── Caller-aware scheduler helpers (opt-in via runtime-config.experimental.callerAffinityScheduler) ─────────────────
+//
+// These add four pieces of per-account state that the legacy round-robin
+// selector ignored:
+//   _stickAffinity     Map<callerKey, lastUsedTs>
+//   _warmCascades      Map<callerKey, lastTouchTs>   (this account has a live
+//                                                     Cascade for this caller)
+//   _consecutiveErrors counter, reset on success
+//   _errorCooldownUntil ms timestamp before which this account is demoted
+//   _reqsTimeline      ring buffer of recent request timestamps (1h window)
+//
+// They are populated lazily so old accounts.json files don't need migrating.
+
+function _ensureSchedulerState(account) {
+  if (!account) return;
+  if (!account._stickAffinity) account._stickAffinity = new Map();
+  if (!account._warmCascades)  account._warmCascades  = new Map();
+  if (typeof account._consecutiveErrors !== 'number') account._consecutiveErrors = 0;
+  if (typeof account._errorCooldownUntil !== 'number') account._errorCooldownUntil = 0;
+  if (!Array.isArray(account._reqsTimeline)) account._reqsTimeline = [];
+}
+
+function _pruneReqsTimeline(account, now, windowMs) {
+  if (!Array.isArray(account._reqsTimeline)) return 0;
+  const cutoff = now - windowMs;
+  while (account._reqsTimeline.length && account._reqsTimeline[0] < cutoff) {
+    account._reqsTimeline.shift();
+  }
+  return account._reqsTimeline.length;
+}
+
+function _pruneAffinity(map, ttlMs, now) {
+  if (!map || typeof map.entries !== 'function') return;
+  const cutoff = now - ttlMs;
+  for (const [key, ts] of map.entries()) {
+    if (ts < cutoff) map.delete(key);
+  }
+}
+
+/**
+ * After a successful request, remember that callerKey used this account so
+ * the next request from the same caller prefers the same account (for
+ * Anthropic prompt-cache prefix continuity).
+ *
+ * Cheap to call on every success — the maps are pruned lazily in selection.
+ */
+export function recordCallerAffinity(apiKey, callerKey) {
+  if (!apiKey || !callerKey) return;
+  const a = accounts.find(x => x.apiKey === apiKey);
+  if (!a) return;
+  _ensureSchedulerState(a);
+  a._stickAffinity.set(callerKey, Date.now());
+}
+
+/**
+ * Mark that this account has a warm Cascade conversation for callerKey.
+ * Called when we know a cascade_id is alive on this (account, ls). Stays
+ * in the map until the cascade is checked out (see clearWarmCascade).
+ */
+export function recordWarmCascade(apiKey, callerKey) {
+  if (!apiKey || !callerKey) return;
+  const a = accounts.find(x => x.apiKey === apiKey);
+  if (!a) return;
+  _ensureSchedulerState(a);
+  a._warmCascades.set(callerKey, Date.now());
+}
+
+export function clearWarmCascade(apiKey, callerKey) {
+  if (!apiKey || !callerKey) return;
+  const a = accounts.find(x => x.apiKey === apiKey);
+  if (!a || !a._warmCascades) return;
+  a._warmCascades.delete(callerKey);
+}
+
+/**
+ * Record an upstream error for this account. Tracked separately from the
+ * existing rate-limit state because rate limits already have explicit
+ * retry-after handling — this counter feeds the "self-cooldown after
+ * repeated transient failures" branch of the scheduler.
+ */
+export function recordAccountError(apiKey, kind = 'unknown') {
+  if (!apiKey) return;
+  const a = accounts.find(x => x.apiKey === apiKey);
+  if (!a) return;
+  _ensureSchedulerState(a);
+  a._consecutiveErrors = (a._consecutiveErrors || 0) + 1;
+  const sched = getSchedulerConfig();
+  if (a._consecutiveErrors >= sched.consecutiveErrorThreshold) {
+    a._errorCooldownUntil = Date.now() + sched.errorCooldownMs;
+    log.warn(`Account ${a.email || a.id} cooldown ${Math.round(sched.errorCooldownMs/1000)}s after ${a._consecutiveErrors} consecutive errors (last=${kind})`);
+  }
+}
+
+/**
+ * Clear the consecutive-error counter on a 200. The cooldown timestamp is
+ * left as-is — if it's in the past it's already inert; if it's in the
+ * future, an in-flight successful response shouldn't undo a cooldown that
+ * was tripped before this request was sent.
+ */
+export function recordAccountSuccess(apiKey) {
+  if (!apiKey) return;
+  const a = accounts.find(x => x.apiKey === apiKey);
+  if (!a) return;
+  _ensureSchedulerState(a);
+  if (a._consecutiveErrors > 0) a._consecutiveErrors = 0;
+}
+
+/**
+ * Add this request to the long-window timeline used by load-imbalance
+ * scoring. Called inline by the selectors so callers don't need to touch it.
+ */
+function _bumpReqsTimeline(account, now) {
+  _ensureSchedulerState(account);
+  account._reqsTimeline.push(now);
+}
+
+/**
+ * Score function for the caller-aware scheduler. Returns a Number; higher
+ * is better. All sub-terms are normalized to [0,1] before the weighted
+ * sum so weight tweaks behave predictably.
+ *
+ * Exported only for unit testing.
+ */
+export function _scheduleScore(account, ctx) {
+  const { now, callerKey, used, limit, poolMeanReqs, sched } = ctx;
+  const w = sched.weights;
+  const inflight = account._inflight || 0;
+  const inflightNorm = Math.min(1, inflight / 4);                 // 4 in-flight = saturation
+  const rpmHeadroom = limit > 0 ? Math.max(0, (limit - used) / limit) : 0;
+
+  let callerAff = 0;
+  if (callerKey && account._stickAffinity?.has(callerKey)) {
+    const age = now - account._stickAffinity.get(callerKey);
+    if (age >= 0 && age <= sched.callerAffinityTtlMs) {
+      callerAff = 1 - age / sched.callerAffinityTtlMs;
+    }
+  }
+
+  let warmCascade = 0;
+  if (callerKey && account._warmCascades?.has(callerKey)) {
+    const age = now - account._warmCascades.get(callerKey);
+    if (age >= 0 && age <= sched.callerAffinityTtlMs) warmCascade = 1;
+  }
+
+  // Approach-limit: linear ramp once usage > rpmWarningThreshold.
+  let approachLimit = 0;
+  if (limit > 0) {
+    const usage = used / limit;
+    if (usage > sched.rpmWarningThreshold) {
+      approachLimit = Math.min(1, (usage - sched.rpmWarningThreshold) / Math.max(1e-6, 1 - sched.rpmWarningThreshold));
+    }
+  }
+
+  // Recent error: full penalty while in cooldown, partial on rising counter.
+  let recentError = 0;
+  if (account._errorCooldownUntil && account._errorCooldownUntil > now) recentError = 1;
+  else if (account._consecutiveErrors > 0) {
+    recentError = Math.min(1, account._consecutiveErrors / Math.max(1, sched.consecutiveErrorThreshold));
+  }
+
+  let loadImbalance = 0;
+  const recent = (account._reqsTimeline || []).length;
+  if (poolMeanReqs > 0 && recent > poolMeanReqs) {
+    loadImbalance = Math.min(1, (recent - poolMeanReqs) / Math.max(1, poolMeanReqs));
+  }
+
+  return (
+      w.inflight       * (1 - inflightNorm)
+    + w.rpmHeadroom    * rpmHeadroom
+    + w.callerAffinity * callerAff
+    + w.warmCascade    * warmCascade
+    - w.approachLimit  * approachLimit
+    - w.recentError    * recentError
+    - w.loadImbalance  * loadImbalance
+  );
+}
+
 // ─── Account selection (tier-weighted RPM) ─────────────────
 
 /**
@@ -505,18 +683,42 @@ export function removeAccount(id) {
  *   1. Keep only active, non-excluded, non-rate-limited accounts.
  *   2. Drop accounts whose 60s request count already equals their tier cap.
  *   3. Pick the account with the highest remaining-ratio (most idle).
+ *      When the caller-aware scheduler is enabled (runtime-config flag
+ *      `experimental.callerAffinityScheduler`), use _scheduleScore() instead
+ *      so callerKey stickiness, approach-limit, and error-cooldown all
+ *      contribute. Backward compatible: when disabled, scoring is byte-for-
+ *      byte the legacy inflight + RPM + LRU.
  *   4. Record the selection timestamp on that account's sliding window.
  *
  * Returns null when every account is temporarily full — callers should
  * wait a moment and retry (see handlers/chat.js queue loop).
+ *
+ * Signature is backward-compatible: existing callers passing
+ * `getApiKey(excludeKeys, modelKey)` continue to work unchanged. New
+ * callers can pass an optional third argument `{ callerKey }` to opt into
+ * caller-affinity scoring.
  */
-export function getApiKey(excludeKeys = [], modelKey = null) {
+export function getApiKey(excludeKeys = [], modelKey = null, opts = {}) {
+  const callerKey = opts.callerKey || '';
+  const schedulerOn = !!callerKey && isExperimentalEnabled('callerAffinityScheduler');
+  const sched = schedulerOn ? getSchedulerConfig() : null;
   const now = Date.now();
   const candidates = [];
   for (const a of accounts) {
     if (a.status !== 'active') continue;
     if (excludeKeys.includes(a.apiKey)) continue;
     if (isRateLimitedForModel(a, modelKey, now)) continue;
+    // Scheduler-only: hard-skip accounts whose self-cooldown window is still
+    // in effect. Without this, a flaky account stays in the candidate list
+    // and only gets demoted by score, which can lose to a busy healthy
+    // account on a tied score.
+    if (schedulerOn) {
+      _ensureSchedulerState(a);
+      _pruneAffinity(a._stickAffinity, sched.callerAffinityTtlMs, now);
+      _pruneAffinity(a._warmCascades,  sched.callerAffinityTtlMs, now);
+      _pruneReqsTimeline(a, now, sched.loadBalanceWindowMs);
+      if (a._errorCooldownUntil && a._errorCooldownUntil > now) continue;
+    }
     const limit = rpmLimitFor(a);
     if (limit <= 0) continue; // expired tier
     const used = pruneRpmHistory(a, now);
@@ -527,25 +729,38 @@ export function getApiKey(excludeKeys = [], modelKey = null) {
   }
   if (candidates.length === 0) return null;
 
-  // Pick the account with the fewest in-flight requests first (so a burst
-  // of concurrent calls spreads across accounts instead of piling onto a
-  // single one that still has RPM headroom — see issue #37). Then prefer
-  // accounts with the highest remaining-ratio, finally least-recently-used.
-  candidates.sort((x, y) => {
-    const ix = x.account._inflight || 0;
-    const iy = y.account._inflight || 0;
-    if (ix !== iy) return ix - iy;
-    const rx = (x.limit - x.used) / x.limit;
-    const ry = (y.limit - y.used) / y.limit;
-    if (ry !== rx) return ry - rx;
-    return (x.account.lastUsed || 0) - (y.account.lastUsed || 0);
-  });
+  if (schedulerOn) {
+    // Caller-aware scoring path. We compute the long-window pool mean once
+    // so per-candidate scoring stays O(N) instead of O(N²). Tiebreakers fall
+    // back to LRU just like the legacy path.
+    const totalRecent = accounts.reduce((s, a) => s + ((a._reqsTimeline || []).length), 0);
+    const poolMeanReqs = accounts.length ? totalRecent / accounts.length : 0;
+    const ctx = { now, callerKey, sched, poolMeanReqs };
+    candidates.sort((x, y) => {
+      const sx = _scheduleScore(x.account, { ...ctx, used: x.used, limit: x.limit });
+      const sy = _scheduleScore(y.account, { ...ctx, used: y.used, limit: y.limit });
+      if (sx !== sy) return sy - sx; // higher score first
+      return (x.account.lastUsed || 0) - (y.account.lastUsed || 0);
+    });
+  } else {
+    // Legacy path — preserved byte-for-byte for backward compatibility.
+    candidates.sort((x, y) => {
+      const ix = x.account._inflight || 0;
+      const iy = y.account._inflight || 0;
+      if (ix !== iy) return ix - iy;
+      const rx = (x.limit - x.used) / x.limit;
+      const ry = (y.limit - y.used) / y.limit;
+      if (ry !== rx) return ry - rx;
+      return (x.account.lastUsed || 0) - (y.account.lastUsed || 0);
+    });
+  }
 
   const { account } = candidates[0];
   const reservationTimestamp = nextReservationToken(now);
   account._rpmHistory.push(reservationTimestamp);
   account.lastUsed = now;
   account._inflight = (account._inflight || 0) + 1;
+  if (schedulerOn) _bumpReqsTimeline(account, now);
   return {
     id: account.id, email: account.email, apiKey: account.apiKey,
     apiServerUrl: account.apiServerUrl || '',
@@ -580,6 +795,14 @@ export function acquireAccountByKey(apiKey, modelKey = null) {
   if (!a) return null;
   if (a.status !== 'active') return null;
   if (isRateLimitedForModel(a, modelKey, now)) return null;
+  // Self-cooldown after consecutive transient errors. Honored regardless
+  // of whether the scheduler flag is on, because once we know an account
+  // is unhealthy it makes no sense to forcibly resume on it just because
+  // it owns a cascade_id — the next call will likely fail too. Returning
+  // null here lets chat.js fall through to a fresh cascade on a healthy
+  // account; the cooldown is short (default 5 min) so the original path
+  // recovers naturally.
+  if (a._errorCooldownUntil && a._errorCooldownUntil > now) return null;
   const limit = rpmLimitFor(a);
   if (limit <= 0) return null;
   const used = pruneRpmHistory(a, now);
@@ -589,6 +812,7 @@ export function acquireAccountByKey(apiKey, modelKey = null) {
   a._rpmHistory.push(reservationTimestamp);
   a.lastUsed = now;
   a._inflight = (a._inflight || 0) + 1;
+  if (isExperimentalEnabled('callerAffinityScheduler')) _bumpReqsTimeline(a, now);
   return {
     id: a.id, email: a.email, apiKey: a.apiKey,
     apiServerUrl: a.apiServerUrl || '',

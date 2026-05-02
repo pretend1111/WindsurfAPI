@@ -63,6 +63,14 @@ const META_TAG_NAMES = new Set([
   'analysis',
   'summary',
   'example',
+  // Claude Code wraps cwd / git status / platform / today's date in <env>.
+  // The date rolls every 24h and cwd/git change when the user moves around,
+  // which makes the fingerprint drift across turns even when the logical
+  // conversation hasn't changed. Strip it here so multi-turn sessions match
+  // their prior pool entries; the actual environment information still
+  // reaches the model intact via the live system prompt — we only remove it
+  // from the *fingerprint key*, not the request body.
+  'env',
 ]);
 
 function buildMetaTagRe() {
